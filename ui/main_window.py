@@ -3,11 +3,11 @@ import shutil
 import tempfile
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QKeySequence, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QVBoxLayout, QWidget
 
-from core.ffmpeg import export_segments_reencode, generate_thumbnails, probe_video
+from core.ffmpeg import export_segments, export_segments_reencode, generate_thumbnails, probe_video
 from core.segment import SegmentsModel
 from ui.segment_list import SegmentListWidget
 from ui.timeline import TimelineWidget
@@ -19,15 +19,17 @@ class ExportWorker(QThread):
     completed = Signal()
     error = Signal(str)
 
-    def __init__(self, input_path: str, segments, output_path: str):
+    def __init__(self, input_path: str, segments, output_path: str, fast_export: bool):
         super().__init__()
         self._input_path = input_path
         self._segments = list(segments)
         self._output_path = output_path
+        self._fast_export = fast_export
 
     def run(self):
         try:
-            export_segments_reencode(self._input_path, self._segments, self._output_path, self.progress.emit)
+            export = export_segments if self._fast_export else export_segments_reencode
+            export(self._input_path, self._segments, self._output_path, self.progress.emit)
             self.completed.emit()
         except Exception as error:
             self.error.emit(str(error))
@@ -70,7 +72,9 @@ class MainWindow(QMainWindow):
         self._export_worker: Optional[ExportWorker] = None
         self._thumbnail_workers: dict[int, ThumbnailWorker] = {}
         self._thumbnail_request_id = 0
+        self._timeline_thumbnail_request = 0
         self._thumbnail_dir: Optional[str] = None
+        self._settings = QSettings("Video Cutter", "Video Cutter")
         self._setup_ui()
         self._setup_menu()
         self._setup_shortcuts()
@@ -109,6 +113,12 @@ class MainWindow(QMainWindow):
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self._export_segments)
         file_menu.addAction(export_action)
+        self._fast_export_action = QAction("Fast export (skip re-encoding)", self)
+        self._fast_export_action.setCheckable(True)
+        self._fast_export_action.setChecked(self._settings.value("fast_export", False, type=bool))
+        self._fast_export_action.setToolTip("Faster, but cuts may start or end on nearby keyframes.")
+        self._fast_export_action.toggled.connect(self._save_fast_export_setting)
+        file_menu.addAction(self._fast_export_action)
         file_menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.setShortcut(QKeySequence.Quit)
@@ -119,6 +129,10 @@ class MainWindow(QMainWindow):
         clear_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
         clear_action.triggered.connect(self._clear_segments)
         edit_menu.addAction(clear_action)
+
+    @Slot(bool)
+    def _save_fast_export_setting(self, enabled: bool):
+        self._settings.setValue("fast_export", enabled)
 
     def _setup_shortcuts(self):
         bindings = [
@@ -143,6 +157,7 @@ class MainWindow(QMainWindow):
         self._player.seek_requested.connect(self._on_seek)
         self._player.position_changed.connect(self._timeline.set_playhead_position)
         self._timeline.seek_requested.connect(self._on_seek)
+        self._timeline.thumbnails_loaded.connect(self._on_timeline_thumbnails_loaded)
         self._segment_list.seek_requested.connect(self._on_seek)
         self._segment_list.delete_requested.connect(self._delete_segment)
         self._segment_list.reorder_requested.connect(self._reorder_segments)
@@ -178,25 +193,37 @@ class MainWindow(QMainWindow):
         worker = ThumbnailWorker(request_id, filepath, thumb_dir, interval)
         worker.completed.connect(self._on_thumbnails_ready)
         worker.error.connect(self._on_thumbnail_error)
-        worker.finished.connect(lambda: self._thumbnail_workers.pop(request_id, None))
         self._thumbnail_workers[request_id] = worker
         worker.start()
 
     @Slot(int, list, str)
     def _on_thumbnails_ready(self, request_id: int, paths: list, output_dir: str):
+        self._thumbnail_workers.pop(request_id, None)
         if request_id != self._thumbnail_request_id:
             shutil.rmtree(output_dir, ignore_errors=True)
             return
         self._cleanup_thumbnail_dir()
         self._thumbnail_dir = output_dir
         interval = max(1.0, self._video_meta["duration"] / 300)
+        self._timeline_thumbnail_request = request_id
         self._timeline.set_thumbnails(paths, interval)
-        pixmaps = [QPixmap(path) for path in paths]
-        self._segment_list.set_thumbnails([pixmap for pixmap in pixmaps if not pixmap.isNull()])
-        self._status_label.setText(f"Loaded: {self._video_meta['width']}x{self._video_meta['height']}  {format_timecode(self._video_meta['duration'])}  Codec: {self._video_meta['codec']}")
+        self._status_label.setText("Loading thumbnail preview...")
+
+    @Slot(list)
+    def _on_timeline_thumbnails_loaded(self, pixmaps: list):
+        if self._timeline_thumbnail_request != self._thumbnail_request_id:
+            return
+        self._segment_list.set_thumbnails(pixmaps)
+        self._segment_list.update_segments(self._segments_model.segments)
+        self._status_label.setText(
+            f"Loaded: {self._video_meta['width']}x{self._video_meta['height']}  "
+            f"{format_timecode(self._video_meta['duration'])}  "
+            f"Codec: {self._video_meta['codec']}"
+        )
 
     @Slot(int, str, str)
     def _on_thumbnail_error(self, request_id: int, error: str, output_dir: str):
+        self._thumbnail_workers.pop(request_id, None)
         shutil.rmtree(output_dir, ignore_errors=True)
         if request_id == self._thumbnail_request_id:
             self._status_label.setText("Loaded video, but thumbnail generation failed")
@@ -221,11 +248,12 @@ class MainWindow(QMainWindow):
         output_path, _ = QFileDialog.getSaveFileName(self, "Export Video", os.path.join(os.getcwd(), "export.mp4"), "MP4 Video (*.mp4);;MKV Video (*.mkv)")
         if not output_path:
             return
-        self._status_label.setText("Exporting...")
+        fast_export = self._fast_export_action.isChecked()
+        self._status_label.setText("Fast exporting..." if fast_export else "Exporting...")
         self._export_progress.setValue(0)
         self._export_progress.setVisible(True)
         self._player.pause()
-        self._export_worker = ExportWorker(self._current_file, segments, output_path)
+        self._export_worker = ExportWorker(self._current_file, segments, output_path, fast_export)
         self._export_worker.completed.connect(self._on_export_done)
         self._export_worker.error.connect(self._on_export_error)
         self._export_worker.progress.connect(self._on_export_progress)

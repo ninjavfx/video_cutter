@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt, Signal, Slot, QUrl
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -11,6 +11,20 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class SeekSlider(QSlider):
+    """A seek slider that jumps directly to its clicked position."""
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and self.width() > 0:
+            fraction = max(0.0, min(1.0, event.position().x() / self.width()))
+            value = round(self.minimum() + fraction * (self.maximum() - self.minimum()))
+            self.setValue(value)
+            self.sliderMoved.emit(value)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class TransportControls(QWidget):
@@ -28,7 +42,7 @@ class TransportControls(QWidget):
         self.time_current = QLabel("00:00:00")
         self.time_current.setMinimumWidth(70)
 
-        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider = SeekSlider(Qt.Horizontal)
         self.seek_slider.setValue(0)
         self.seek_slider.sliderMoved.connect(self._on_seek)
 

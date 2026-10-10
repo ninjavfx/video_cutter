@@ -96,13 +96,12 @@ def export_segments(
     output_path: str,
     progress_callback: Optional[Callable[[float], None]] = None,
 ) -> str:
-    """Export selected segments as a single video file."""
+    """Quickly export segments with stream copy, which may cut on keyframes."""
     if not segments:
         raise FFmpegError("No segments to export")
 
     tmpdir = tempfile.mkdtemp(prefix="vcut_")
     try:
-        # Extract each segment
         for i, seg in enumerate(segments):
             seg_path = os.path.join(tmpdir, f"seg_{i:04d}.mkv")
             duration = seg.out_time - seg.in_time
@@ -119,14 +118,14 @@ def export_segments(
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode != 0:
                 raise FFmpegError(f"Segment extraction failed: {result.stderr}")
+            if progress_callback:
+                progress_callback((i + 1) / (len(segments) + 1))
 
-        # Build file list for concat demuxer
         list_path = os.path.join(tmpdir, "concat_list.txt")
         with open(list_path, "w") as f:
             for i in range(len(segments)):
                 f.write(f"file 'seg_{i:04d}.mkv'\n")
 
-        # Concatenate all segments
         cmd = [
             "ffmpeg",
             "-f", "concat",
@@ -139,13 +138,12 @@ def export_segments(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
             raise FFmpegError(f"Concatenation failed: {proc.stderr}")
-
+        if progress_callback:
+            progress_callback(1.0)
         return output_path
-
-    except Exception:
-        _cleanup(tmpdir)
-        raise
-    else:
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise FFmpegError(f"Fast export failed: {error}") from error
+    finally:
         _cleanup(tmpdir)
 
 

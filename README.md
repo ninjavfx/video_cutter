@@ -2,7 +2,7 @@
 
 A keyboard-friendly desktop video cutter for macOS and Linux. Load a video, mark the parts you want to keep, reorder them, and export them as one clean MP4 or MKV.
 
-Video Cutter is built with Python, PySide6, and the system `ffmpeg` tools. Exports are re-encoded so cuts are accurate rather than limited to source keyframes.
+Video Cutter is built with Python, PySide6, and the system `ffmpeg` tools. By default, exports are re-encoded so cuts are accurate rather than limited to source keyframes.
 
 ## Features
 
@@ -13,6 +13,7 @@ Video Cutter is built with Python, PySide6, and the system `ffmpeg` tools. Expor
 - Export one combined video, including videos with no audio stream
 - Generate thumbnails and export video without freezing the application window
 - Show export progress
+- Optional fast stream-copy export for videos where speed matters more than frame-accurate cuts
 
 ## Requirements
 
@@ -50,6 +51,8 @@ On Windows PowerShell, activate the environment with:
 3. Seek to the end and press `Enter` again to add the segment.
 4. Repeat for each clip. Drag segments in the right panel to set their export order.
 5. Choose **File → Export Segments** or press `Ctrl+E`.
+
+For a much quicker export, enable **File → Fast export (skip re-encoding)** before exporting. This preserves the source streams instead of re-encoding them, but IN and OUT points can move to nearby keyframes and may produce imperfect cuts. The setting is remembered for future launches.
 
 The source file is never modified.
 

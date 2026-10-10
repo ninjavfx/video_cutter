@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QPainter,
@@ -24,6 +24,8 @@ class TimelineStrip(QWidget):
 
     seek_requested = Signal(float)
     scroll_requested = Signal(int)
+    thumbnails_changed = Signal()
+    thumbnails_loaded = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,20 +37,42 @@ class TimelineStrip(QWidget):
         self._playhead_position: Optional[float] = None
         self._thumb_interval: float = 1.0
         self._scroll_offset: int = 0
+        self._thumbnail_generation = 0
 
         self._strip_height = 120
         self._margin = 2
 
     def set_thumbnails(self, paths: List[str], interval: float = 1.0):
-        """Load thumbnail images."""
+        """Load thumbnail images in small UI batches."""
         self._thumbnails = paths
         self._thumb_interval = interval
         self._pixmaps.clear()
-        for path in paths:
-            pm = QPixmap(path)
-            if not pm.isNull():
-                self._pixmaps.append(pm)
+        self._scroll_offset = 0
+        self._thumbnail_generation += 1
         self.update_segments()
+        if not paths:
+            self.setMinimumHeight(40)
+            self.thumbnails_changed.emit()
+            self.thumbnails_loaded.emit([])
+            return
+        QTimer.singleShot(0, lambda: self._load_thumbnail_batch(self._thumbnail_generation, 0))
+
+    def _load_thumbnail_batch(self, generation: int, start: int):
+        if generation != self._thumbnail_generation:
+            return
+        for path in self._thumbnails[start:start + 12]:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                self._pixmaps.append(pixmap)
+        if self._pixmaps:
+            self.setMinimumHeight(self._pixmaps[0].height() + 28)
+        self.thumbnails_changed.emit()
+        self.update()
+        next_start = start + 12
+        if next_start < len(self._thumbnails):
+            QTimer.singleShot(0, lambda: self._load_thumbnail_batch(generation, next_start))
+        else:
+            self.thumbnails_loaded.emit(list(self._pixmaps))
 
     def set_duration(self, duration: float):
         self._video_duration = duration
@@ -88,16 +112,13 @@ class TimelineStrip(QWidget):
         fraction = x / total_width
         return fraction * self._video_duration
 
-    def set_size_hint(self):
-        if self._pixmaps:
-            tw = self._pixmaps[0].width() + self._margin
-            th = self._pixmaps[0].height()
-            total_w = len(self._pixmaps) * tw
-            self.setMinimumHeight(th + 40)
-
     def paintEvent(self, event):
         super().paintEvent(event)
         if not self._pixmaps:
+            painter = QPainter(self)
+            painter.setPen(QColor("#888"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Generating thumbnail preview…" if self._thumbnails else "No video loaded")
+            painter.end()
             return
 
         painter = QPainter(self)
@@ -169,11 +190,14 @@ class TimelineWidget(QWidget):
     """Timeline with scroll bar and info label."""
 
     seek_requested = Signal(float)
+    thumbnails_loaded = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._strip = TimelineStrip()
         self._strip.seek_requested.connect(self.seek_requested.emit)
+        self._strip.thumbnails_changed.connect(self._update_scroll_range)
+        self._strip.thumbnails_loaded.connect(self.thumbnails_loaded.emit)
 
         self._scroll_bar = QScrollBar(Qt.Horizontal)
         self._scroll_bar.valueChanged.connect(self._on_scroll)
@@ -193,7 +217,6 @@ class TimelineWidget(QWidget):
 
     def set_thumbnails(self, paths: List[str], interval: float = 1.0):
         self._strip.set_thumbnails(paths, interval)
-        self._update_scroll_range()
 
     def _on_scroll(self, value: int):
         self._strip._scroll_offset = value
