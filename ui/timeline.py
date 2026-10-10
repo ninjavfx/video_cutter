@@ -1,14 +1,12 @@
-import os
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QPainter,
     QPixmap,
     QPen,
     QFont,
-    QImageReader,
 )
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -25,6 +23,7 @@ class TimelineStrip(QWidget):
     """Horizontal thumbnail strip with segment markers."""
 
     seek_requested = Signal(float)
+    scroll_requested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,6 +32,7 @@ class TimelineStrip(QWidget):
         self._segments: List[Segment] = []
         self._video_duration: float = 0.0
         self._pending_in: Optional[float] = None
+        self._playhead_position: Optional[float] = None
         self._thumb_interval: float = 1.0
         self._scroll_offset: int = 0
 
@@ -52,6 +52,14 @@ class TimelineStrip(QWidget):
 
     def set_duration(self, duration: float):
         self._video_duration = duration
+        self.update()
+
+    def set_playhead_position(self, time: float):
+        self._playhead_position = max(0.0, min(time, self._video_duration))
+        self.update()
+
+    def thumbnail_width(self) -> int:
+        return self._pixmaps[0].width() + self._margin if self._pixmaps else 1
 
     def set_pending_in(self, time: Optional[float]):
         self._pending_in = time
@@ -95,7 +103,7 @@ class TimelineStrip(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        thumb_w = self._pixmaps[0].width() + self._margin
+        thumb_w = self.thumbnail_width()
         start_idx = max(0, self._scroll_offset)
         visible_width = self.width()
 
@@ -132,12 +140,16 @@ class TimelineStrip(QWidget):
             painter.setPen(QPen(QColor(255, 0, 0), 2))
             painter.drawLine(int(in_x), 0, int(in_x), overlay_y)
 
-        # Draw current playhead position indicator area
+        if self._playhead_position is not None:
+            playhead_x = self._time_to_x(self._playhead_position) - (self._scroll_offset * thumb_w)
+            painter.setPen(QPen(QColor(255, 220, 0), 2))
+            painter.drawLine(int(playhead_x), 0, int(playhead_x), self.height())
+
         painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self._pixmaps:
-            thumb_w = self._pixmaps[0].width() + self._margin
+            thumb_w = self.thumbnail_width()
             click_x = event.position().x() + (self._scroll_offset * thumb_w)
             time = self._x_to_time(click_x)
             time = max(0.0, min(time, self._video_duration))
@@ -148,9 +160,8 @@ class TimelineStrip(QWidget):
         if angle > 0:
             self._scroll_offset = max(0, self._scroll_offset - 3)
         else:
-            self._scroll_offset = min(
-                len(self._pixmaps) - 1, self._scroll_offset + 3
-            )
+            self._scroll_offset = min(len(self._pixmaps) - 1, self._scroll_offset + 3)
+        self.scroll_requested.emit(self._scroll_offset)
         self.update()
 
 
@@ -166,6 +177,7 @@ class TimelineWidget(QWidget):
 
         self._scroll_bar = QScrollBar(Qt.Horizontal)
         self._scroll_bar.valueChanged.connect(self._on_scroll)
+        self._strip.scroll_requested.connect(self._scroll_bar.setValue)
 
         self._info_label = QLabel("No video loaded")
         self._info_label.setStyleSheet("padding: 2px 8px;")
@@ -188,11 +200,28 @@ class TimelineWidget(QWidget):
         self._strip.update()
 
     def _update_scroll_range(self):
-        max_val = max(0, len(self._strip._pixmaps) - 5)
+        visible = max(1, self._strip.width() // self._strip.thumbnail_width())
+        max_val = max(0, len(self._strip._pixmaps) - visible)
         self._scroll_bar.setRange(0, max_val)
+        self._scroll_bar.setPageStep(visible)
 
     def set_duration(self, duration: float):
         self._strip.set_duration(duration)
+
+    def set_playhead_position(self, time: float):
+        self._strip.set_playhead_position(time)
+        if not self._strip._pixmaps or self._strip._video_duration <= 0:
+            return
+        index = min(
+            len(self._strip._pixmaps) - 1,
+            int((time / self._strip._video_duration) * len(self._strip._pixmaps)),
+        )
+        visible = max(1, self._strip.width() // self._strip.thumbnail_width())
+        current = self._scroll_bar.value()
+        if index < current:
+            self._scroll_bar.setValue(index)
+        elif index >= current + visible:
+            self._scroll_bar.setValue(index - visible + 1)
 
     def update_segments(self, segments: List[Segment]):
         self._strip.update_segments(segments)
@@ -203,3 +232,7 @@ class TimelineWidget(QWidget):
 
     def set_pending_in(self, time):
         self._strip.set_pending_in(time)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_scroll_range()

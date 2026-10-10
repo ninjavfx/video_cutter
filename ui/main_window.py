@@ -1,50 +1,55 @@
 import os
+import shutil
 import tempfile
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, Slot
-from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtGui import QAction, QKeySequence, QPixmap
+from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QVBoxLayout, QWidget
 
-from core.ffmpeg import probe_video, generate_thumbnails, export_segments_reencode, FFmpegError
+from core.ffmpeg import export_segments_reencode, generate_thumbnails, probe_video
 from core.segment import SegmentsModel
-from ui.video_widget import VideoPlayerWidget, format_timecode
-from ui.timeline import TimelineWidget
 from ui.segment_list import SegmentListWidget
+from ui.timeline import TimelineWidget
+from ui.video_widget import VideoPlayerWidget, format_timecode
 
 
 class ExportWorker(QThread):
-    """Background thread for video export."""
-
-    progress = Signal(str)
-    finished = Signal()
+    progress = Signal(float)
+    completed = Signal()
     error = Signal(str)
 
     def __init__(self, input_path: str, segments, output_path: str):
         super().__init__()
         self._input_path = input_path
-        self._segments = segments
+        self._segments = list(segments)
         self._output_path = output_path
 
     def run(self):
         try:
-            export_segments_reencode(
-                self._input_path,
-                self._segments,
-                self._output_path,
-            )
-            self.finished.emit()
-        except FFmpegError as e:
-            self.error.emit(str(e))
+            export_segments_reencode(self._input_path, self._segments, self._output_path, self.progress.emit)
+            self.completed.emit()
+        except Exception as error:
+            self.error.emit(str(error))
+
+
+class ThumbnailWorker(QThread):
+    completed = Signal(int, list, str)
+    error = Signal(int, str, str)
+
+    def __init__(self, request_id: int, filepath: str, output_dir: str, interval: float):
+        super().__init__()
+        self._request_id = request_id
+        self._filepath = filepath
+        self._output_dir = output_dir
+        self._interval = interval
+
+    def run(self):
+        try:
+            paths = generate_thumbnails(self._filepath, self._output_dir, self._interval)
+            self.completed.emit(self._request_id, paths, self._output_dir)
+        except Exception as error:
+            self.error.emit(self._request_id, str(error), self._output_dir)
 
 
 class MainWindow(QMainWindow):
@@ -52,18 +57,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Video Cutter")
         self.resize(1024, 768)
-
         self._current_file: Optional[str] = None
         self._segments_model = SegmentsModel()
         self._video_meta: dict = {}
-
         self._player = VideoPlayerWidget()
         self._timeline = TimelineWidget()
         self._segment_list = SegmentListWidget()
         self._status_label = QLabel("Open a video file to begin")
-
+        self._export_progress = QProgressBar()
+        self._export_progress.setRange(0, 100)
+        self._export_progress.setVisible(False)
         self._export_worker: Optional[ExportWorker] = None
-
+        self._thumbnail_workers: dict[int, ThumbnailWorker] = {}
+        self._thumbnail_request_id = 0
+        self._thumbnail_dir: Optional[str] = None
         self._setup_ui()
         self._setup_menu()
         self._setup_shortcuts()
@@ -75,269 +82,199 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
-
-        # Left column: player + timeline
         left_col = QVBoxLayout()
         left_col.setSpacing(6)
         left_col.addWidget(self._player, 1)
         self._timeline.setMaximumHeight(160)
-        left_col.addWidget(self._timeline, 0)
-
-        main_layout.addLayout(left_col, 1)
-
-        # Right column: segment list panel
-        self._segment_list.setMinimumWidth(240)
-        self._segment_list.setMaximumWidth(320)
-        self._segment_list.setStyleSheet("background: #222; border-left: 1px solid #444;")
-        main_layout.addWidget(self._segment_list, 0)
-
-        # Status bar area (below everything via a separate approach)
+        left_col.addWidget(self._timeline)
         status_container = QWidget()
         status_layout = QHBoxLayout(status_container)
         status_layout.setContentsMargins(0, 4, 0, 0)
-        status_layout.addWidget(self._status_label)
-        status_layout.addStretch()
-
-        # We need to restructure: put status at bottom of left column
-        left_col.addWidget(status_container, 0)
+        status_layout.addWidget(self._status_label, 1)
+        status_layout.addWidget(self._export_progress)
+        left_col.addWidget(status_container)
+        main_layout.addLayout(left_col, 1)
+        self._segment_list.setMinimumWidth(240)
+        self._segment_list.setMaximumWidth(320)
+        self._segment_list.setStyleSheet("background: #222; border-left: 1px solid #444;")
+        main_layout.addWidget(self._segment_list)
 
     def _setup_menu(self):
-        menubar = self.menuBar()
-
-        file_menu = menubar.addMenu("File")
-
+        file_menu = self.menuBar().addMenu("File")
         open_action = QAction("Open Video...", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self._open_video)
         file_menu.addAction(open_action)
-
-        file_menu.addSeparator()
-
         export_action = QAction("Export Segments...", self)
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self._export_segments)
         file_menu.addAction(export_action)
-
         file_menu.addSeparator()
-
         quit_action = QAction("Quit", self)
         quit_action.setShortcut(QKeySequence.Quit)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
-
-        edit_menu = menubar.addMenu("Edit")
-
+        edit_menu = self.menuBar().addMenu("Edit")
         clear_action = QAction("Clear All Segments", self)
         clear_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
         clear_action.triggered.connect(self._clear_segments)
         edit_menu.addAction(clear_action)
 
     def _setup_shortcuts(self):
-        # Space: play/pause
-        space_act = QAction(self)
-        space_act.setShortcut(QKeySequence(Qt.Key_Space))
-        space_act.triggered.connect(self._toggle_play_pause)
-        self.addAction(space_act)
-
-        # Enter: mark in/out points
-        enter_act = QAction(self)
-        enter_act.setShortcut(QKeySequence(Qt.Key_Return))
-        enter_act.triggered.connect(self._mark_point)
-        self.addAction(enter_act)
-
-        # Also handle Enter from numpad
-        enter2_act = QAction(self)
-        enter2_act.setShortcut(QKeySequence(Qt.Key_Enter))
-        enter2_act.triggered.connect(self._mark_point)
-        self.addAction(enter2_act)
-
-        # Left/Right: seek +/- 5 seconds
-        left_act = QAction(self)
-        left_act.setShortcut(QKeySequence(Qt.Key_Left))
-        left_act.triggered.connect(lambda: self._seek_delta(-5))
-        self.addAction(left_act)
-
-        right_act = QAction(self)
-        right_act.setShortcut(QKeySequence(Qt.Key_Right))
-        right_act.triggered.connect(lambda: self._seek_delta(5))
-        self.addAction(right_act)
-
-        # Escape: clear pending IN point
-        esc_act = QAction(self)
-        esc_act.setShortcut(QKeySequence(Qt.Key_Escape))
-        esc_act.triggered.connect(self._clear_pending)
-        self.addAction(esc_act)
-
-        # Frame stepping: , and . keys
-        step_back_act = QAction(self)
-        step_back_act.setShortcut(QKeySequence(Qt.Key_Comma))
-        step_back_act.triggered.connect(self._player.step_backward)
-        self.addAction(step_back_act)
-
-        step_fwd_act = QAction(self)
-        step_fwd_act.setShortcut(QKeySequence(Qt.Key_Period))
-        step_fwd_act.triggered.connect(self._player.step_forward)
-        self.addAction(step_fwd_act)
+        bindings = [
+            (Qt.Key_Space, self._toggle_play_pause),
+            (Qt.Key_Return, self._mark_point),
+            (Qt.Key_Enter, self._mark_point),
+            (Qt.Key_Left, lambda: self._seek_delta(-5)),
+            (Qt.Key_Right, lambda: self._seek_delta(5)),
+            (Qt.Key_Escape, self._clear_pending),
+            (Qt.Key_Comma, self._player.step_backward),
+            (Qt.Key_Period, self._player.step_forward),
+        ]
+        for key, handler in bindings:
+            action = QAction(self)
+            action.setShortcut(QKeySequence(key))
+            action.triggered.connect(handler)
+            self.addAction(action)
 
     def _connect_signals(self):
-        self._player.play_requested.connect(self._on_play)
-        self._player.pause_requested.connect(self._on_pause)
+        self._player.play_requested.connect(self._player.play)
+        self._player.pause_requested.connect(self._player.pause)
         self._player.seek_requested.connect(self._on_seek)
+        self._player.position_changed.connect(self._timeline.set_playhead_position)
         self._timeline.seek_requested.connect(self._on_seek)
         self._segment_list.seek_requested.connect(self._on_seek)
         self._segment_list.delete_requested.connect(self._delete_segment)
-
-    # --- File operations ---
+        self._segment_list.reorder_requested.connect(self._reorder_segments)
 
     def _open_video(self):
-        filepath, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Video",
-            "",
-            "Video Files (*.mp4 *.mov *.avi *.mkv *.mpg *.mpeg *.webm);;All Files (*)",
-        )
+        filepath, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv *.mpg *.mpeg *.webm);;All Files (*)")
         if not filepath:
             return
-
         try:
             meta = probe_video(filepath)
-            self._current_file = filepath
-            self._video_meta = meta
-            self._segments_model.clear_all()
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"Failed to load video:\n{error}")
+            return
+        self._current_file = filepath
+        self._video_meta = meta
+        self._segments_model.clear_all()
+        self._cleanup_thumbnail_dir()
+        self._player.load_video(filepath)
+        self._player.set_frame_rate(meta.get("fps", 30))
+        self._timeline.set_duration(meta["duration"])
+        self._timeline.set_thumbnails([])
+        self._timeline.update_segments([])
+        self._timeline.set_playhead_position(0.0)
+        self._segment_list.set_thumbnails([])
+        self._segment_list.set_duration(meta["duration"])
+        self._segment_list.update_segments([])
+        self.setWindowTitle(f"Video Cutter - {os.path.basename(filepath)}")
+        self._status_label.setText("Generating thumbnails in background...")
+        thumb_dir = tempfile.mkdtemp(prefix="vcut_thumbs_")
+        interval = max(1.0, meta["duration"] / 300)
+        self._thumbnail_request_id += 1
+        request_id = self._thumbnail_request_id
+        worker = ThumbnailWorker(request_id, filepath, thumb_dir, interval)
+        worker.completed.connect(self._on_thumbnails_ready)
+        worker.error.connect(self._on_thumbnail_error)
+        worker.finished.connect(lambda: self._thumbnail_workers.pop(request_id, None))
+        self._thumbnail_workers[request_id] = worker
+        worker.start()
 
-            # Load into player
-            self._player.load_video(filepath)
-            self._player.set_frame_rate(meta.get("fps", 30))
+    @Slot(int, list, str)
+    def _on_thumbnails_ready(self, request_id: int, paths: list, output_dir: str):
+        if request_id != self._thumbnail_request_id:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return
+        self._cleanup_thumbnail_dir()
+        self._thumbnail_dir = output_dir
+        interval = max(1.0, self._video_meta["duration"] / 300)
+        self._timeline.set_thumbnails(paths, interval)
+        pixmaps = [QPixmap(path) for path in paths]
+        self._segment_list.set_thumbnails([pixmap for pixmap in pixmaps if not pixmap.isNull()])
+        self._status_label.setText(f"Loaded: {self._video_meta['width']}x{self._video_meta['height']}  {format_timecode(self._video_meta['duration'])}  Codec: {self._video_meta['codec']}")
 
-            # Generate thumbnails
-            self._status_label.setText("Generating thumbnails...")
-            QApplication.processEvents()
+    @Slot(int, str, str)
+    def _on_thumbnail_error(self, request_id: int, error: str, output_dir: str):
+        shutil.rmtree(output_dir, ignore_errors=True)
+        if request_id == self._thumbnail_request_id:
+            self._status_label.setText("Loaded video, but thumbnail generation failed")
+            QMessageBox.warning(self, "Thumbnail Error", f"Could not generate thumbnails:\n{error}")
 
-            thumb_dir = tempfile.mkdtemp(prefix="vcut_thumbs_")
-            interval = max(1.0, meta["duration"] / 300)  # ~300 thumbs max
-            thumbs = generate_thumbnails(filepath, thumb_dir, interval=interval)
-
-            self._timeline.set_thumbnails(thumbs, interval=interval)
-            self._timeline.set_duration(meta["duration"])
-            self._timeline.update_segments([])
-
-            # Pass thumbnail pixmaps to segment list for lookup
-            from PySide6.QtGui import QPixmap
-            pixmaps = [QPixmap(p) for p in thumbs if not QPixmap(p).isNull()]
-            self._segment_list.set_thumbnails(pixmaps)
-            self._segment_list.set_duration(meta["duration"])
-            self._segment_list.update_segments([])
-
-            self.setWindowTitle(f"Video Cutter - {os.path.basename(filepath)}")
-            self._status_label.setText(
-                f"Loaded: {meta['width']}x{meta['height']}  "
-                f"{format_timecode(meta['duration'])}  "
-                f"Codec: {meta['codec']}"
-            )
-
-        except FFmpegError as e:
-            QMessageBox.critical(self, "Error", f"Failed to load video:\n{e}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Unexpected error:\n{e}")
+    def _cleanup_thumbnail_dir(self):
+        if self._thumbnail_dir:
+            shutil.rmtree(self._thumbnail_dir, ignore_errors=True)
+            self._thumbnail_dir = None
 
     def _export_segments(self):
+        if self._export_worker and self._export_worker.isRunning():
+            QMessageBox.information(self, "Export in Progress", "Wait for the current export to finish.")
+            return
         segments = self._segments_model.segments
         if not segments:
-            QMessageBox.information(
-                self, "No Segments", "Mark some segments first (press ENTER to set IN/OUT points)."
-            )
+            QMessageBox.information(self, "No Segments", "Mark some segments first (press ENTER to set IN/OUT points).")
             return
-
         if self._segments_model.has_pending_in:
-            QMessageBox.warning(
-                self,
-                "Incomplete Segment",
-                "You have a pending IN point. Press ENTER again to complete it, or ESC to discard.",
-            )
+            QMessageBox.warning(self, "Incomplete Segment", "You have a pending IN point. Press ENTER again to complete it, or ESC to discard.")
             return
-
-        output_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Video",
-            os.path.join(os.getcwd(), "export.mp4"),
-            "MP4 Video (*.mp4);;MKV Video (*.mkv)",
-        )
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Video", os.path.join(os.getcwd(), "export.mp4"), "MP4 Video (*.mp4);;MKV Video (*.mkv)")
         if not output_path:
             return
-
-        self._status_label.setText("Exporting... please wait")
+        self._status_label.setText("Exporting...")
+        self._export_progress.setValue(0)
+        self._export_progress.setVisible(True)
         self._player.pause()
-
-        self._export_worker = ExportWorker(
-            self._current_file, segments, output_path
-        )
-        self._export_worker.finished.connect(self._on_export_done)
+        self._export_worker = ExportWorker(self._current_file, segments, output_path)
+        self._export_worker.completed.connect(self._on_export_done)
         self._export_worker.error.connect(self._on_export_error)
+        self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.start()
 
     def _on_export_done(self):
+        output_path = self._export_worker._output_path
+        self._export_progress.setVisible(False)
         self._status_label.setText("Export complete!")
-        QMessageBox.information(
-            self, "Done", f"Video exported successfully:\n{self._export_worker._output_path}"
-        )
+        QMessageBox.information(self, "Done", f"Video exported successfully:\n{output_path}")
 
     def _on_export_error(self, error_msg: str):
+        self._export_progress.setVisible(False)
         self._status_label.setText("Export failed")
         QMessageBox.critical(self, "Export Error", f"Failed to export:\n{error_msg}")
 
-    # --- Playback controls ---
+    @Slot(float)
+    def _on_export_progress(self, progress: float):
+        self._export_progress.setValue(round(progress * 100))
 
     def _toggle_play_pause(self):
-        if self._player.is_playing():
-            self._on_pause()
-        else:
-            self._on_play()
-
-    def _on_play(self):
-        self._player.play()
-
-    def _on_pause(self):
-        self._player.pause()
+        self._player.pause() if self._player.is_playing() else self._player.play()
 
     @Slot(float)
     def _on_seek(self, seconds: float):
-        if not self._current_file:
-            return
-        self._player.seek(seconds)
+        if self._current_file:
+            self._player.seek(seconds)
 
     def _seek_delta(self, delta: float):
-        current = self._player.current_position()
-        new_pos = max(0.0, current + delta)
-        self._on_seek(new_pos)
-
-    # --- Segment marking ---
+        self._on_seek(min(self._player.duration(), max(0.0, self._player.current_position() + delta)))
 
     def _mark_point(self):
         if not self._current_file:
             return
-
         current_time = self._player.current_position()
-
         if self._segments_model.has_pending_in:
-            # Mark OUT point
-            self._segments_model.set_out_point(current_time)
-            segs = self._segments_model.segments
-            self._timeline.update_segments(segs)
-            self._segment_list.update_segments(segs)
+            in_time = self._segments_model.pending_in_time
+            if not self._segments_model.set_out_point(current_time):
+                self._status_label.setText("OUT point must be after the IN point.")
+                return
+            segments = self._segments_model.segments
+            self._timeline.update_segments(segments)
+            self._segment_list.update_segments(segments)
             self._timeline.set_pending_in(None)
-            self._status_label.setText(
-                f"Segment marked: {format_timecode(self._segments_model.pending_in_time or 0)} -> "
-                f"{format_timecode(current_time)}  "
-                f"({len(self._segments_model.segments)} total)"
-            )
-        else:
-            # Mark IN point
-            self._segments_model.set_in_point(current_time)
-            self._timeline.set_pending_in(current_time)
-            self._status_label.setText(
-                f"IN point set at {format_timecode(current_time)}. "
-                f"Scrub forward and press ENTER for OUT."
-            )
+            self._status_label.setText(f"Segment marked: {format_timecode(in_time or 0)} → {format_timecode(current_time)} ({len(segments)} total)")
+            return
+        self._segments_model.set_in_point(current_time)
+        self._timeline.set_pending_in(current_time)
+        self._status_label.setText(f"IN point set at {format_timecode(current_time)}. Scrub forward and press ENTER for OUT.")
 
     def _clear_pending(self):
         if self._segments_model.has_pending_in:
@@ -347,10 +284,15 @@ class MainWindow(QMainWindow):
 
     def _delete_segment(self, index: int):
         self._segments_model.remove_segment(index)
-        segs = self._segments_model.segments
-        self._timeline.update_segments(segs)
-        self._segment_list.update_segments(segs)
-        self._status_label.setText(f"Segment deleted. {len(segs)} remaining.")
+        self._timeline.update_segments(self._segments_model.segments)
+        self._segment_list.update_segments(self._segments_model.segments)
+        self._status_label.setText(f"Segment deleted. {len(self._segments_model.segments)} remaining.")
+
+    def _reorder_segments(self, from_index: int, to_index: int):
+        self._segments_model.move_segment(from_index, to_index)
+        self._timeline.update_segments(self._segments_model.segments)
+        self._segment_list.update_segments(self._segments_model.segments)
+        self._status_label.setText("Segment order updated.")
 
     def _clear_segments(self):
         self._segments_model.clear_all()

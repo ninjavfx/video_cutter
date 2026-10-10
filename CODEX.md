@@ -26,11 +26,11 @@ Requires: Python 3.10+, ffmpeg installed on system PATH.
 | `ui/segment_list.py` | Segment list panel: thumbnails, timecodes, seek on click, DEL button | ~175 |
 | `ui/main_window.py` | QMainWindow: two-column layout, menus, shortcuts, export orchestration | ~340 |
 
-## Current State (May 15, 2026)
+## Current State (October 9, 2026)
 
 MVP + v1 functional. Core workflow works end-to-end: open video → mark segments with Enter → see them in segment list panel on right → delete or seek to any segment → export to MP4. Frame-by-frame stepping available via buttons and `,`/`.` keys. Fixed audio-less video crash by adding `has_audio_stream()` check before building ffmpeg filter graph.
 
-Known limitations documented in TASKS.md (blocking thumbnail gen, no live playhead, no drag-to-reorder yet).
+The timeline follows the live playhead, thumbnail generation runs in a worker thread, and segments can be reordered by drag and drop. Export progress is displayed while ffmpeg runs.
 
 ## Key Conventions
 

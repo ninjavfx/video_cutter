@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from typing import Callable, List, Optional
 
 from core.segment import Segment
@@ -21,7 +22,10 @@ def probe_video(filepath: str) -> dict:
         "-show_streams",
         filepath,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise FFmpegError(f"ffprobe failed: {e}") from e
     if result.returncode != 0:
         raise FFmpegError(f"ffprobe failed: {result.stderr}")
 
@@ -73,7 +77,10 @@ def generate_thumbnails(
         "-start_number", "0",
         os.path.join(output_dir, "thumb_%04d.jpg"),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise FFmpegError(f"Thumbnail generation failed: {e}") from e
     if result.returncode != 0:
         raise FFmpegError(f"Thumbnail generation failed: {result.stderr}")
 
@@ -148,7 +155,10 @@ def has_audio_stream(input_path: str) -> bool:
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_streams", input_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     if result.returncode != 0:
         return False
     data = json.loads(result.stdout)
@@ -224,11 +234,50 @@ def export_segments_reencode(
         output_path,
     ])
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if proc.returncode != 0:
-        raise FFmpegError(f"Export failed: {proc.stderr}")
+    _run_export_with_progress(cmd, sum(segment.duration for segment in segments), progress_callback)
 
     return output_path
+
+
+def _run_export_with_progress(
+    cmd: List[str], total_duration: float, progress_callback: Optional[Callable[[float], None]],
+):
+    progress_cmd = [cmd[0], "-v", "error", "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    try:
+        proc = subprocess.Popen(
+            progress_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as e:
+        raise FFmpegError(f"Could not start ffmpeg: {e}") from e
+
+    try:
+        started = time.monotonic()
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if time.monotonic() - started > 600:
+                proc.kill()
+                raise FFmpegError("Export timed out after 10 minutes")
+            key, separator, value = line.strip().partition("=")
+            if separator and key == "out_time_us" and progress_callback and total_duration > 0:
+                try:
+                    out_time = float(value)
+                except ValueError:
+                    continue
+                progress_callback(min(out_time / 1_000_000 / total_duration, 0.99))
+        stderr = proc.stderr.read() if proc.stderr else ""
+        if proc.wait() != 0:
+            raise FFmpegError(f"Export failed: {stderr}")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        raise
+
+    if progress_callback:
+        progress_callback(1.0)
 
 
 def _cleanup(path: str):

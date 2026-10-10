@@ -58,11 +58,11 @@
 
 **Trade-off:** No built-in item selection or drag-and-drop support — would need to be implemented manually if added later.
 
-## Threading: QThread for Export Only
+## Threading: QThread for Long-running ffmpeg Work
 
-**Decision:** Export runs in a background `ExportWorker(QThread)`. Thumbnail generation and video probing run on the main thread (known limitation).
+**Decision:** Export and thumbnail generation run in background `QThread` workers. Video probing remains on the main thread because it is normally brief.
 
-**Why:** Export is the longest-running operation (minutes for large files). Thumbnails typically complete within seconds. Main-thread thumbnail gen was accepted as MVP trade-off.
+**Why:** Export and thumbnail extraction can take long enough to make the application appear unresponsive. Worker signals keep the interface responsive and allow progress feedback during export.
 
 ## Layout: Two-Column (Player Left, Segment List Right)
 

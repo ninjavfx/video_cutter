@@ -61,6 +61,7 @@ class VideoPlayerWidget(QWidget):
     play_requested = Signal()
     pause_requested = Signal()
     seek_requested = Signal(float)
+    position_changed = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,6 +120,9 @@ class VideoPlayerWidget(QWidget):
 
     def _connect_signals(self):
         self._player.positionChanged.connect(self._transport.set_position)
+        self._player.positionChanged.connect(
+            lambda position_ms: self.position_changed.emit(position_ms / 1000.0)
+        )
         self._player.durationChanged.connect(self._transport.set_duration)
 
     def load_video(self, filepath: str):
